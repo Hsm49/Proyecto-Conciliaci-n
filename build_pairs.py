@@ -49,6 +49,10 @@ class MatchParams:
         require_same_trans_exact: Exigir mismo Código en exactos (bloqueo).
         w1..w6: Pesos para score del match relajado.
         log_interval_* / show_progress: Control de logging y progreso.
+        relaxed_require_same_bank: Si True, el relajado exige mismo Id banco como llave.
+        relaxed_require_same_code: Si True, el relajado exige mismo Código como llave.
+        relaxed_max_estimated_pairs: Umbral duro para abortar relajado si el estimado supera este valor.
+        max_accounts_relaxed: Límite opcional de cuentas a procesar en relajado (debug).
     """
     amount_tolerance: float = 0.01  # misma moneda
     date_window_days: int = 1       # días
@@ -66,6 +70,11 @@ class MatchParams:
     log_interval_groups: int = 50
     log_interval_rows: int = 10000
     show_progress: bool = True
+    # NUEVO: controles relajado
+    relaxed_require_same_bank: bool = True
+    relaxed_require_same_code: bool = True
+    relaxed_max_estimated_pairs: int = 200_000_000
+    max_accounts_relaxed: Optional[int] = None
 
 P = MatchParams()
 
@@ -325,89 +334,191 @@ def _build_exact_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: Matc
 
     return pd.DataFrame(records, columns=["s_idx", "b_idx", "score"])
 
-def _build_relaxed_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: MatchParams) -> pd.DataFrame:
-    """Genera candidatos relajados usando joins vectorizados (mismo account, tolerancias) y score compuesto."""
-    start_time = time.perf_counter()
-    # Asegurar columnas clave existen
-    for col in ["Id banco", "Código", "Cuenta bancaria", "Referencia", "Fecha_dt", "Monto_f", "Monto_key", "Fecha_key", "b_idx", "s_idx"]:
-        if col not in df_s.columns:
-            df_s[col] = "" if col in ("Id banco", "Código", "Cuenta bancaria", "Referencia", "Monto_key", "Fecha_key") else pd.NA
-        if col not in df_b.columns:
-            df_b[col] = "" if col in ("Id banco", "Código", "Cuenta bancaria", "Referencia", "Monto_key", "Fecha_key") else pd.NA
+def _int_cents(v: float) -> Optional[int]:
+    if v is None or pd.isna(v):
+        return None
+    try:
+        return int(round(float(v) * 100))
+    except Exception:
+        return None
 
-    # Filtrar válidos básicos
+def _build_relaxed_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: MatchParams) -> pd.DataFrame:
+    """Genera candidatos relajados por CUENTA en streaming, sin joins globales.
+
+    Estrategia:
+    - Para cada cuenta presente en ambos lados:
+      - Expandir SOLO lado Sistema con offsets de fecha +/- window y monto +/- tol (en centavos) para construir llaves discretas.
+      - Hacer merge hash con el lado Banco (sin expandir) por llaves: Cuenta + Fecha_key + Monto_cents (+ opcionalmente Banco/Código).
+      - Puntuar y asignar de forma codiciosa dentro de la cuenta (sin conflictos entre cuentas).
+    - Devuelve DataFrame con columnas [s_idx, b_idx, score].
+    """
+    import math
+    start_time = time.perf_counter()
+
+    # Filtrar válidos
     s = df_s[~df_s["Monto_f"].isna() & df_s["Fecha_dt"].notna()].copy()
     b = df_b[~df_b["Monto_f"].isna() & df_b["Fecha_dt"].notna()].copy()
-
-    # Merge por cuenta para reducir combinaciones (hash join)
-    cand = s.merge(b, how="inner", on=["Cuenta bancaria"], suffixes=("_s", "_b"))
-    if cand.empty:
+    if s.empty or b.empty:
         return pd.DataFrame(columns=["s_idx", "b_idx", "score"])
 
-    # Tolerancia de monto (vectorizado) y ventana de fecha
-    amt_diff = (cand["Monto_f_s"] - cand["Monto_f_b"]).abs()
-    ok_amt = amt_diff <= params.amount_tolerance
-    days_diff = (cand["Fecha_dt_s"] - cand["Fecha_dt_b"]).abs().dt.days
-    ok_date = days_diff <= params.date_window_days
-    mask = ok_amt & ok_date
-    if not mask.any():
+    # Preparar llaves discretas en BANCO (no expandimos Banco)
+    b = b.copy()
+    b["Fecha_key"] = b["Fecha_dt"].dt.strftime("%Y-%m-%d")
+    b["Monto_cents"] = (b["Monto_f"] * 100).round().astype("Int64")
+
+    # Definir llaves de join
+    join_keys = ["Cuenta bancaria", "Fecha_key", "Monto_cents"]
+    if params.relaxed_require_same_bank:
+        join_keys.append("Id banco")
+    if params.relaxed_require_same_code:
+        join_keys.append("Código")
+
+    # Estimación temprana de combinaciones (abort temprano si excede umbral)
+    # Cuenta agrupada (o Cuenta+Banco+Código si se exige) y multiplicar tamaños por factor de expansión
+    group_keys = ["Cuenta bancaria"]
+    if params.relaxed_require_same_bank:
+        group_keys.append("Id banco")
+    if params.relaxed_require_same_code:
+        group_keys.append("Código")
+
+    s_counts = s.groupby(group_keys, observed=False).size()
+    b_counts = b.groupby(group_keys, observed=False).size()
+    common_groups = s_counts.index.intersection(b_counts.index)
+    if len(common_groups) == 0:
         return pd.DataFrame(columns=["s_idx", "b_idx", "score"])
 
-    cand = cand.loc[mask, [
-        "s_idx", "b_idx",
-        "Id banco_s", "Id banco_b",
-        "Código_s", "Código_b",
-        "Referencia_s", "Referencia_b",
-        "Monto_f_s", "Monto_f_b",
-        "Fecha_dt_s", "Fecha_dt_b"
-    ]].reset_index(drop=True)
-
-    # Similitud de referencia por lotes
-    batch = 500_000
-    rows = []
-    total = len(cand)
-    for i in range(0, total, batch):
-        part = cand.iloc[i:i+batch].copy()
-        ref_sim = np.array([_ref_sim(a, b) for a, b in zip(part["Referencia_s"].tolist(), part["Referencia_b"].tolist())], dtype=float)
-        # Componentes
-        same_account = 1.0  # ya es misma cuenta
-        same_bank = (part["Id banco_s"].values == part["Id banco_b"].values).astype(float)
-        same_trans = (part["Código_s"].values == part["Código_b"].values).astype(float)
-        # Penalizaciones continuas
-        adiff = (part["Monto_f_s"].values - part["Monto_f_b"].values)
-        adiff = np.abs(adiff)
-        tdiff = np.abs((part["Fecha_dt_s"].values - part["Fecha_dt_b"].values).astype("timedelta64[D]").astype(int))
-        amt_term = 1.0 - np.minimum(adiff / max(params.amount_tolerance, 1e-9), 1.0)
-        time_term = 1.0 - np.minimum(tdiff / max(params.date_window_days, 1), 1.0)
-        ref_term = np.where(ref_sim >= params.ref_similarity_threshold, ref_sim, 0.0)
-
-        score = (
-            params.w1_same_account * same_account +
-            params.w2_same_bank * same_bank +
-            params.w6_same_trans * same_trans +
-            params.w3_amount * amt_term +
-            params.w4_time * time_term +
-            params.w5_ref * ref_term
+    # Factor de expansión: (2*date_window+1) * (2*cent_tol+1)
+    cent_tol = max(0, int(round(params.amount_tolerance * 100)))
+    exp_factor = (2 * params.date_window_days + 1) * (2 * cent_tol + 1)
+    # Estimado superior
+    est_pairs = int(sum((int(s_counts[g]) * int(b_counts[g]) * exp_factor) for g in common_groups))
+    if est_pairs > params.relaxed_max_estimated_pairs:
+        raise MemoryError(
+            f"[ABORT RELAJADO] Estimado de pares {est_pairs:,} excede el umbral "
+            f"relaxed_max_estimated_pairs={params.relaxed_max_estimated_pairs:,}. "
+            f"Reduce tolerancias/ventanas o activa relaxed_require_same_*."
         )
-        ok = score > 0
-        if ok.any():
-            outp = part.loc[ok, ["s_idx", "b_idx"]].copy()
-            outp["score"] = score[ok]
-            rows.append(outp)
 
-        # Progreso por lotes
-        if params.show_progress:
-            done = min(i+batch, total)
-            pct = (done/total)*100.0
+    # Procesamiento por CUENTA (sin joins globales)
+    accounts_s = s["Cuenta bancaria"].astype(str)
+    accounts_b = b["Cuenta bancaria"].astype(str)
+    common_accounts = sorted(set(accounts_s.unique()).intersection(accounts_b.unique()))
+
+    results: List[pd.DataFrame] = []
+    processed_accounts = 0
+    total_accounts = len(common_accounts)
+    # Precalcular offsets
+    date_offsets = list(range(-params.date_window_days, params.date_window_days + 1))
+    cent_offsets = list(range(-cent_tol, cent_tol + 1))
+
+    # Reducir columnas para join / score
+    s_base_cols = ["s_idx", "Cuenta bancaria", "Id banco", "Código", "Referencia", "Fecha_dt", "Monto_f"]
+    b_base_cols = ["b_idx", "Cuenta bancaria", "Id banco", "Código", "Referencia", "Fecha_dt", "Monto_f", "Fecha_key", "Monto_cents"]
+
+    for acct in common_accounts:
+        if params.max_accounts_relaxed is not None and processed_accounts >= params.max_accounts_relaxed:
+            break
+
+        s_g = s.loc[s["Cuenta bancaria"] == acct, s_base_cols].copy()
+        b_g = b.loc[b["Cuenta bancaria"] == acct, b_base_cols].copy()
+        if s_g.empty or b_g.empty:
+            processed_accounts += 1
+            continue
+
+        # Opcionalmente restringir por banco/código antes de expandir si se exigen
+        if params.relaxed_require_same_bank:
+            # Procesar por banco para reducir combinaciones
+            bank_groups = sorted(set(s_g["Id banco"].unique()).intersection(set(b_g["Id banco"].unique())))
+        else:
+            bank_groups = [None]
+
+        for bank in bank_groups:
+            s_gb = s_g if bank is None else s_g[s_g["Id banco"] == bank]
+            b_gb = b_g if bank is None else b_g[b_g["Id banco"] == bank]
+            if s_gb.empty or b_gb.empty:
+                continue
+
+            if params.relaxed_require_same_code:
+                code_groups = sorted(set(s_gb["Código"].unique()).intersection(set(b_gb["Código"].unique())))
+            else:
+                code_groups = [None]
+
+            for code in code_groups:
+                s_gbc = s_gb if code is None else s_gb[s_gb["Código"] == code]
+                b_gbc = b_gb if code is None else b_gb[b_gb["Código"] == code]
+                if s_gbc.empty or b_gbc.empty:
+                    continue
+
+                # Expandir S: offsets de fecha y centavos
+                frames = []
+                # Precalcular Monto_cents base en S
+                s_m_cents = (s_gbc["Monto_f"] * 100).round().astype("Int64")
+                for doff in date_offsets:
+                    s_tmp = s_gbc.copy()
+                    s_tmp["Fecha_key"] = (s_tmp["Fecha_dt"] + pd.to_timedelta(doff, unit="D")).dt.strftime("%Y-%m-%d")
+                    # Variantes de centavos (expandir por offsets)
+                    for coff in cent_offsets:
+                        st = s_tmp.copy()
+                        st["Monto_cents"] = (s_m_cents + coff).astype("Int64")
+                        frames.append(st[["s_idx", "Cuenta bancaria", "Id banco", "Código", "Referencia", "Fecha_dt", "Monto_f", "Fecha_key", "Monto_cents"]])
+                s_exp = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["s_idx","Cuenta bancaria","Id banco","Código","Referencia","Fecha_dt","Monto_f","Fecha_key","Monto_cents"])
+                if s_exp.empty:
+                    continue
+
+                # Merge por llaves discretas
+                k = ["Cuenta bancaria", "Fecha_key", "Monto_cents"]
+                if params.relaxed_require_same_bank:
+                    k.append("Id banco")
+                if params.relaxed_require_same_code:
+                    k.append("Código")
+
+                cand = s_exp.merge(
+                    b_gbc[["b_idx", "Cuenta bancaria", "Id banco", "Código", "Referencia", "Fecha_dt", "Monto_f", "Fecha_key", "Monto_cents"]],
+                    how="inner",
+                    on=k,
+                    suffixes=("_s", "_b")
+                )
+                if cand.empty:
+                    continue
+
+                # Puntuar
+                ref_sim = np.array([_ref_sim(a, b) for a, b in zip(cand["Referencia_s"].tolist(), cand["Referencia_b"].tolist())], dtype=float)
+                same_account = 1.0  # ya estamos por cuenta
+                same_bank = (cand["Id banco_s"].values == cand["Id banco_b"].values).astype(float)
+                same_trans = (cand["Código_s"].values == cand["Código_b"].values).astype(float)
+                adiff = (cand["Monto_f_s"].values - cand["Monto_f_b"].values)
+                adiff = np.abs(adiff)
+                tdiff = np.abs((cand["Fecha_dt_s"].values - cand["Fecha_dt_b"].values).astype("timedelta64[D]").astype(int))
+                amt_term = 1.0 - np.minimum(adiff / max(params.amount_tolerance, 1e-9), 1.0)
+                time_term = 1.0 - np.minimum(tdiff / max(params.date_window_days, 1), 1.0)
+                ref_term = np.where(ref_sim >= params.ref_similarity_threshold, ref_sim, 0.0)
+                score = (
+                    params.w1_same_account * same_account +
+                    params.w2_same_bank * same_bank +
+                    params.w6_same_trans * same_trans +
+                    params.w3_amount * amt_term +
+                    params.w4_time * time_term +
+                    params.w5_ref * ref_term
+                )
+
+                ok = score > 0
+                if not np.any(ok):
+                    continue
+
+                outp = cand.loc[ok, ["s_idx", "b_idx"]].copy()
+                outp["score"] = score[ok]
+                # Greedy por cuenta/banco/código (subconjunto pequeño)
+                assigned = _greedy_assign(outp, "s_idx", "b_idx", "score")
+                if not assigned.empty:
+                    results.append(assigned)
+
+        processed_accounts += 1
+        if params.show_progress and processed_accounts % max(1, params.log_interval_groups) == 0:
             elapsed = time.perf_counter() - start_time
-            print(f"[PROGRESS][Relajado fast] {done:,}/{total:,} ({pct:0.1f}%) | Tiempo: {elapsed:0.1f}s")
+            pct = (processed_accounts / max(total_accounts, 1)) * 100.0
+            print(f"[PROGRESS][Relajado streaming] Cuentas: {processed_accounts:,}/{total_accounts:,} ({pct:0.1f}%) | Tiempo: {elapsed:0.1f}s")
 
-    candidates = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["s_idx","b_idx","score"])
-    if candidates.empty:
-        return candidates
-    # Evitar reutilización
-    assigned = _greedy_assign(candidates, "s_idx", "b_idx", "score")
-    return assigned
+    return pd.concat(results, ignore_index=True) if results else pd.DataFrame(columns=["s_idx","b_idx","score"])
 
 def build_pairs() -> pd.DataFrame:
     """Punto de entrada: lee Sistema/Banco, ejecuta F0/F1, fallback y relajado; exporta salida y estadísticas."""
@@ -451,12 +562,18 @@ def build_pairs() -> pd.DataFrame:
     used_s = set(match_exact["s_idx"].tolist())
     used_b = set(match_exact["b_idx"].tolist())
 
-    # Fase 2 (relajado) sobre no usados
+    # Fase 2 (relajado streaming por cuenta) con abort temprano si se estima muy grande
     s_left = df_s[~df_s["s_idx"].isin(used_s)].reset_index(drop=True)
     b_left = df_b[~df_b["b_idx"].isin(used_b)].reset_index(drop=True)
     print(f"[INFO] Sobrantes para relajado — Sistema: {len(s_left):,}, Banco: {len(b_left):,}")
-    cand_relaxed = _build_relaxed_candidates(s_left, b_left, P)
-    match_relaxed = _greedy_assign(cand_relaxed, "s_idx", "b_idx", "score")
+    try:
+        cand_relaxed = _build_relaxed_candidates(s_left, b_left, P)
+    except MemoryError as me:
+        print(str(me))
+        print("[INFO] Se omite fase relajada por riesgo de memoria. Continúo solo con matches exactos.")
+        cand_relaxed = pd.DataFrame(columns=["s_idx","b_idx","score"])
+
+    match_relaxed = _greedy_assign(cand_relaxed, "s_idx", "b_idx", "score") if not cand_relaxed.empty else cand_relaxed
     print(f"[INFO] Matches relajados asignados: {len(match_relaxed):,}")
 
     # Unir matches
