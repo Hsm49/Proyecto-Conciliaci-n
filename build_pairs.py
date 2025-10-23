@@ -227,13 +227,13 @@ def _build_exact_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: Matc
     # Bloqueo por (Id banco?, Cuenta, Código)
     # Si se requiere mismo banco, el bloque usa (Id banco, Cuenta, Código); si no, (Cuenta, Código)
     if params.require_same_bank_exact:
-        s_blocks = df_s.groupby(["Id banco", "Cuenta bancaria", "Código"])
-        b_blocks = df_b.groupby(["Id banco", "Cuenta bancaria", "Código"])
+        s_blocks = df_s.groupby(["Id banco", "Cuenta bancaria", "Código"], observed=False)
+        b_blocks = df_b.groupby(["Id banco", "Cuenta bancaria", "Código"], observed=False)
         common_keys = set(s_blocks.groups.keys()).intersection(b_blocks.groups.keys())
         block_keys = [("Id banco", "Cuenta bancaria", "Código"), common_keys]
     else:
-        s_blocks = df_s.groupby(["Cuenta bancaria", "Código"])
-        b_blocks = df_b.groupby(["Cuenta bancaria", "Código"])
+        s_blocks = df_s.groupby(["Cuenta bancaria", "Código"], observed=False)
+        b_blocks = df_b.groupby(["Cuenta bancaria", "Código"], observed=False)
         common_keys = set(s_blocks.groups.keys()).intersection(b_blocks.groups.keys())
         block_keys = [("Cuenta bancaria", "Código"), common_keys]
 
@@ -326,102 +326,88 @@ def _build_exact_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: Matc
     return pd.DataFrame(records, columns=["s_idx", "b_idx", "score"])
 
 def _build_relaxed_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: MatchParams) -> pd.DataFrame:
-    """Genera candidatos relajados por cuenta con score compuesto y tolerancias."""
+    """Genera candidatos relajados usando joins vectorizados (mismo account, tolerancias) y score compuesto."""
     start_time = time.perf_counter()
-    # Bloqueo por "Cuenta bancaria" (reduce combinaciones). No exigimos mismo banco ni mismo código.
-    s_blocks = df_s.groupby(["Cuenta bancaria"])
-    b_blocks = df_b.groupby(["Cuenta bancaria"])
-    common_accounts = set(s_blocks.groups.keys()).intersection(b_blocks.groups.keys())
-    records = []
-    groups_total = len(common_accounts)
-    groups_done = 0
-    rows_scanned = 0
-    pair_checks = 0
-    candidates_valid = 0
+    # Asegurar columnas clave existen
+    for col in ["Id banco", "Código", "Cuenta bancaria", "Referencia", "Fecha_dt", "Monto_f", "Monto_key", "Fecha_key", "b_idx", "s_idx"]:
+        if col not in df_s.columns:
+            df_s[col] = "" if col in ("Id banco", "Código", "Cuenta bancaria", "Referencia", "Monto_key", "Fecha_key") else pd.NA
+        if col not in df_b.columns:
+            df_b[col] = "" if col in ("Id banco", "Código", "Cuenta bancaria", "Referencia", "Monto_key", "Fecha_key") else pd.NA
 
-    if params.show_progress:
-        print(f"[INFO] (Relajado) Cuentas comunes: {groups_total:,}")
+    # Filtrar válidos básicos
+    s = df_s[~df_s["Monto_f"].isna() & df_s["Fecha_dt"].notna()].copy()
+    b = df_b[~df_b["Monto_f"].isna() & df_b["Fecha_dt"].notna()].copy()
 
-    for acct in common_accounts:
-        s_g = df_s.loc[s_blocks.groups[acct]]
-        b_g = df_b.loc[b_blocks.groups[acct]]
-        groups_done += 1
-
-        b_amount = b_g["Monto_f"].to_numpy()
-        b_dates = b_g["Fecha_dt"].to_numpy()
-        b_refs = b_g["Referencia"].to_numpy()
-        b_banks = b_g["Id banco"].to_numpy()
-        b_codes = b_g["Código"].to_numpy()
-        b_idxs = b_g["b_idx"].to_numpy()
-
-        for s_row in s_g.itertuples(index=False):
-            s_amt = getattr(s_row, "Monto_f")
-            s_date = getattr(s_row, "Fecha_dt")
-            s_ref = getattr(s_row, "Referencia")
-            s_bank = getattr(s_row, "Id banco")
-            s_code = getattr(s_row, "Código")
-            s_idx = getattr(s_row, "s_idx")
-
-            if s_amt is None or s_date is None:
-                continue
-
-            # Filtros mínimos: monto dentro tolerancia + fecha dentro ventana
-            amt_diff = np.abs(b_amount - s_amt)
-            ok_amt = amt_diff <= params.amount_tolerance
-            days_diff = np.array([np.nan if (pd.isna(d) or s_date is None) else abs((d - s_date).days) for d in b_dates])
-            ok_date = days_diff <= params.date_window_days
-            mask = ok_amt & ok_date
-            if not mask.any():
-                continue
-
-            # Componentes del score
-            same_account = np.ones(len(b_g), dtype=float)  # estamos en mismo acct
-            same_bank = (b_banks == s_bank).astype(float)
-            same_trans = (b_codes == s_code).astype(float)
-            ref_sim = np.array([_ref_sim(s_ref, br) for br in b_refs])
-
-            # Sumar pesos solo si cumple umbrales donde aplica
-            amt_term = np.where(ok_amt, (1.0 - np.minimum(amt_diff / max(params.amount_tolerance, 1e-9), 1.0)), 0.0)
-            time_term = np.where(ok_date, (1.0 - np.minimum(days_diff / max(params.date_window_days, 1), 1.0)), 0.0)
-            ref_term = np.where(ref_sim >= params.ref_similarity_threshold, ref_sim, 0.0)
-
-            score = (
-                params.w1_same_account * same_account +
-                params.w2_same_bank * same_bank +
-                params.w6_same_trans * same_trans +
-                params.w3_amount * amt_term +
-                params.w4_time * time_term +
-                params.w5_ref * ref_term
-            )
-
-            # Stats parciales
-            rows_scanned += 1
-            pair_checks += len(b_amount)
-
-            for j, m in enumerate(mask):
-                if not m:
-                    continue
-                sc = float(score[j])
-                if sc <= 0:
-                    continue
-                records.append((s_idx, b_idxs[j], sc))
-
-            # Log por filas
-            if params.show_progress and rows_scanned % max(1, params.log_interval_rows) == 0:
-                elapsed = time.perf_counter() - start_time
-                rate = rows_scanned / max(elapsed, 1e-9)
-                print(f"[PROGRESS][Relajado] Filas sist eval: {rows_scanned:,} | Checks: {pair_checks:,} | Records: {len(records):,} | {rate:,.0f} filas/s")
-
-        # Log por grupos
-        if params.show_progress and groups_done % max(1, params.log_interval_groups) == 0:
-            elapsed = time.perf_counter() - start_time
-            pct = (groups_done / max(groups_total, 1)) * 100.0
-            print(f"[PROGRESS][Relajado] Grupos: {groups_done:,}/{groups_total:,} ({pct:0.1f}%) | Records: {len(records):,} | Tiempo: {elapsed:0.1f}s")
-
-    if not records:
+    # Merge por cuenta para reducir combinaciones (hash join)
+    cand = s.merge(b, how="inner", on=["Cuenta bancaria"], suffixes=("_s", "_b"))
+    if cand.empty:
         return pd.DataFrame(columns=["s_idx", "b_idx", "score"])
 
-    return pd.DataFrame(records, columns=["s_idx", "b_idx", "score"])
+    # Tolerancia de monto (vectorizado) y ventana de fecha
+    amt_diff = (cand["Monto_f_s"] - cand["Monto_f_b"]).abs()
+    ok_amt = amt_diff <= params.amount_tolerance
+    days_diff = (cand["Fecha_dt_s"] - cand["Fecha_dt_b"]).abs().dt.days
+    ok_date = days_diff <= params.date_window_days
+    mask = ok_amt & ok_date
+    if not mask.any():
+        return pd.DataFrame(columns=["s_idx", "b_idx", "score"])
+
+    cand = cand.loc[mask, [
+        "s_idx", "b_idx",
+        "Id banco_s", "Id banco_b",
+        "Código_s", "Código_b",
+        "Referencia_s", "Referencia_b",
+        "Monto_f_s", "Monto_f_b",
+        "Fecha_dt_s", "Fecha_dt_b"
+    ]].reset_index(drop=True)
+
+    # Similitud de referencia por lotes
+    batch = 500_000
+    rows = []
+    total = len(cand)
+    for i in range(0, total, batch):
+        part = cand.iloc[i:i+batch].copy()
+        ref_sim = np.array([_ref_sim(a, b) for a, b in zip(part["Referencia_s"].tolist(), part["Referencia_b"].tolist())], dtype=float)
+        # Componentes
+        same_account = 1.0  # ya es misma cuenta
+        same_bank = (part["Id banco_s"].values == part["Id banco_b"].values).astype(float)
+        same_trans = (part["Código_s"].values == part["Código_b"].values).astype(float)
+        # Penalizaciones continuas
+        adiff = (part["Monto_f_s"].values - part["Monto_f_b"].values)
+        adiff = np.abs(adiff)
+        tdiff = np.abs((part["Fecha_dt_s"].values - part["Fecha_dt_b"].values).astype("timedelta64[D]").astype(int))
+        amt_term = 1.0 - np.minimum(adiff / max(params.amount_tolerance, 1e-9), 1.0)
+        time_term = 1.0 - np.minimum(tdiff / max(params.date_window_days, 1), 1.0)
+        ref_term = np.where(ref_sim >= params.ref_similarity_threshold, ref_sim, 0.0)
+
+        score = (
+            params.w1_same_account * same_account +
+            params.w2_same_bank * same_bank +
+            params.w6_same_trans * same_trans +
+            params.w3_amount * amt_term +
+            params.w4_time * time_term +
+            params.w5_ref * ref_term
+        )
+        ok = score > 0
+        if ok.any():
+            outp = part.loc[ok, ["s_idx", "b_idx"]].copy()
+            outp["score"] = score[ok]
+            rows.append(outp)
+
+        # Progreso por lotes
+        if params.show_progress:
+            done = min(i+batch, total)
+            pct = (done/total)*100.0
+            elapsed = time.perf_counter() - start_time
+            print(f"[PROGRESS][Relajado fast] {done:,}/{total:,} ({pct:0.1f}%) | Tiempo: {elapsed:0.1f}s")
+
+    candidates = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["s_idx","b_idx","score"])
+    if candidates.empty:
+        return candidates
+    # Evitar reutilización
+    assigned = _greedy_assign(candidates, "s_idx", "b_idx", "score")
+    return assigned
 
 def build_pairs() -> pd.DataFrame:
     """Punto de entrada: lee Sistema/Banco, ejecuta F0/F1, fallback y relajado; exporta salida y estadísticas."""
