@@ -1,3 +1,15 @@
+"""Construcción de la hoja/archivo 'Banco' desde PS_BANK_STMT_TBL (todas las variantes).
+
+Este script:
+- Detecta todas las variantes de PS_BANK_STMT_TBL en 'Set Datos Conciliacion' (por archivo u hoja).
+- Normaliza columnas al esquema base y limpia Id/Referencia/Cuenta/Fecha/Monto/Código.
+- Deduplica y exporta 'Banco.csv'.
+
+Uso:
+- pip install pandas python-dateutil openpyxl pyarrow
+- python build_banco.py
+"""
+
 from __future__ import annotations
 import re
 import sys
@@ -31,16 +43,24 @@ COLUMN_MAP: Dict[str, Dict[str, str]] = {
 
 @dataclass
 class ReadResult:
+    """Resultado de lectura de una fuente detectada del Banco.
+    Attributes:
+        table: Nombre base ('PS_BANK_STMT_TBL').
+        df: DataFrame con datos crudos leídos como strings.
+        source: Identificador de origen (archivo y, si aplica, hoja).
+    """
     table: str
     df: pd.DataFrame
     source: str  # filepath or file+sheet
 
 
 def _strip_accents(s: str) -> str:
+    """Elimina acentos del texto."""
     return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
 
 
 def _norm_text(x: object) -> str:
+    """Normaliza texto: trim, mayúsculas, sin acentos y espacios colapsados."""
     if pd.isna(x):
         return ""
     s = str(x).strip()
@@ -50,6 +70,7 @@ def _norm_text(x: object) -> str:
 
 
 def _norm_account(x: object) -> str:
+    """Normaliza cuenta bancaria a solo dígitos; corrige notación científica de Excel."""
     if pd.isna(x):
         return ""
     # Manejar notación científica o tipos numéricos de Excel
@@ -74,6 +95,7 @@ def _norm_account(x: object) -> str:
 
 
 def _parse_date(x: object) -> Optional[pd.Timestamp]:
+    """Parsea fechas en formatos comunes y retorna Timestamp (o None si inválida)."""
     if pd.isna(x) or (isinstance(x, str) and x.strip() == ""):
         return None
     if isinstance(x, (pd.Timestamp, )):
@@ -89,11 +111,13 @@ def _parse_date(x: object) -> Optional[pd.Timestamp]:
 
 
 def _norm_date_to_iso(x: object) -> str:
+    """Devuelve fecha ISO 'YYYY-MM-DD' o vacío si no es válida."""
     dt = _parse_date(x)
     return "" if dt is None else dt.strftime("%Y-%m-%d")
 
 
 def _parse_amount(x: object) -> Optional[float]:
+    """Convierte montos a float manejando separadores y signos de moneda."""
     if pd.isna(x) or (isinstance(x, str) and x.strip() == ""):
         return None
     s = str(x).strip()
@@ -117,6 +141,7 @@ def _parse_amount(x: object) -> Optional[float]:
 
 
 def _read_csv(fp: Path) -> pd.DataFrame:
+    """Lee CSV probando codificaciones 'utf-8-sig' y 'latin-1' antes del fallback."""
     for enc in ("utf-8-sig", "latin-1"):
         try:
             return pd.read_csv(fp, encoding=enc, dtype=str)
@@ -126,6 +151,7 @@ def _read_csv(fp: Path) -> pd.DataFrame:
 
 
 def _read_any(filepath: Path, sheet: Optional[str] = None) -> pd.DataFrame:
+    """Lee CSV/XLSX/Parquet/TSV en DataFrame de strings."""
     ext = filepath.suffix.lower()
     if ext == ".csv":
         return _read_csv(filepath)
@@ -139,10 +165,7 @@ def _read_any(filepath: Path, sheet: Optional[str] = None) -> pd.DataFrame:
 
 
 def _find_sources(input_dir: Path, base_name: str) -> List[Tuple[str, Path, Optional[str]]]:
-    """
-    Devuelve lista de (table_name, filepath, sheet_name|None) para TODAS las variantes, e.g. PS_BANK_STMT_TBL_*
-    Coincide por nombre de archivo y por nombre de hoja en Excel.
-    """
+    """Busca todas las variantes de PS_BANK_STMT_TBL por nombre de archivo y hojas de Excel."""
     results: List[Tuple[str, Path, Optional[str]]] = []
     if not input_dir.exists():
         return results
@@ -178,6 +201,7 @@ def _find_sources(input_dir: Path, base_name: str) -> List[Tuple[str, Path, Opti
 
 
 def _rename_and_project(df: pd.DataFrame, table: str) -> pd.DataFrame:
+    """Mapea columnas al esquema base y aplica normalización de valores."""
     mapping = COLUMN_MAP[table]
     cols_inter = {src: dst for src, dst in mapping.items() if src in df.columns}
     df = df.rename(columns=cols_inter)
@@ -201,6 +225,7 @@ def _rename_and_project(df: pd.DataFrame, table: str) -> pd.DataFrame:
 
 
 def build_banco() -> pd.DataFrame:
+    """Construye el DataFrame unificado del Banco con deduplicación y orden sugerido."""
     sources = _find_sources(INPUT_DIR, BANK_TABLE)
     if not sources:
         print(f"[ADVERTENCIA] No se encontraron archivos para {BANK_TABLE} en: {INPUT_DIR}")
@@ -232,6 +257,7 @@ def build_banco() -> pd.DataFrame:
 
 
 def main():
+    """Punto de entrada: construye y exporta Banco.csv, mostrando previsualización."""
     print(f"[INFO] Carpeta de entrada: {INPUT_DIR}")
     df_bnk = build_banco()
     if df_bnk.empty:

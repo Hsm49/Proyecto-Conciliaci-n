@@ -1,3 +1,15 @@
+"""Versión de prueba: emparejamiento exacto Sistema ↔ Banco con corte temprano (--limit).
+
+Qué hace:
+- Solo matching exacto por claves (Id banco opcional, Cuenta, Código, ventana de Fecha y tolerancia de Monto).
+- Calcula similitud de referencia y asigna el mejor candidato disponible.
+- Se detiene al alcanzar --limit matches, útil para pruebas de rendimiento y verificación.
+
+Uso:
+- pip install pandas numpy python-dateutil rapidfuzz
+- python "build_pairs_sample.py" --limit 500 --amount-tol 0.01 --date-window 1 --ref-threshold 0.90
+"""
+
 from __future__ import annotations
 import argparse
 from dataclasses import dataclass
@@ -19,6 +31,7 @@ SCHEMA_BASE = ["Id banco", "Cuenta bancaria", "Referencia", "Fecha", "Monto", "C
 
 @dataclass
 class MatchParams:
+    """Parámetros mínimos para el matching exacto de la versión sample."""
     amount_tolerance: float = 0.01
     date_window_days: int = 1
     ref_similarity_threshold: float = 0.90
@@ -26,6 +39,7 @@ class MatchParams:
     require_same_trans_exact: bool = True
 
 def _to_float(x) -> Optional[float]:
+    """Convierte strings de monto a float; tolera comas, símbolos y vacíos."""
     if pd.isna(x):
         return None
     s = str(x).strip().replace(",", "")
@@ -39,6 +53,7 @@ def _to_float(x) -> Optional[float]:
             return None
 
 def _to_date(x) -> Optional[pd.Timestamp]:
+    """Parsea fechas a Timestamp o None si inválida."""
     if pd.isna(x) or str(x).strip() == "":
         return None
     if isinstance(x, (pd.Timestamp, )):
@@ -51,16 +66,19 @@ def _to_date(x) -> Optional[pd.Timestamp]:
     return None
 
 def _norm_text(s: object) -> str:
+    """Normaliza texto: trim en mayúsculas; vacío si NaN."""
     if pd.isna(s):
         return ""
     return str(s).strip().upper()
 
 def _ref_sim(a: str, b: str) -> float:
+    """Similitud de referencias en [0,1] con token_set_ratio (RapidFuzz)."""
     if not a or not b:
         return 0.0
     return token_set_ratio(a, b) / 100.0
 
 def _prepare(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """Prepara DataFrame: normaliza tipos y crea índice único para trazabilidad."""
     df = df[SCHEMA_BASE].copy()
     df["Id banco"] = df["Id banco"].map(_norm_text)
     df["Cuenta bancaria"] = df["Cuenta bancaria"].map(lambda x: "" if pd.isna(x) else "".join(ch for ch in str(x) if ch.isdigit()))
@@ -72,6 +90,7 @@ def _prepare(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     return df
 
 def build_pairs_sample(params: MatchParams, limit: int) -> pd.DataFrame:
+    """Genera hasta 'limit' emparejamientos exactos (sin relajado) y exporta CSV de muestra."""
     start_time = time.perf_counter()
     if not SISTEMA_CSV.exists() or not BANCO_CSV.exists():
         raise FileNotFoundError("Faltan Sistema.csv o Banco.csv")
@@ -227,6 +246,7 @@ def build_pairs_sample(params: MatchParams, limit: int) -> pd.DataFrame:
     return out
 
 def parse_args() -> argparse.Namespace:
+    """Parser de argumentos de línea de comandos para configuración y progreso."""
     ap = argparse.ArgumentParser(description="Emparejamiento exacto con límite (sample)")
     ap.add_argument("--limit", type=int, default=500, help="Número máximo de emparejamientos exactos a generar")
     ap.add_argument("--amount-tol", type=float, default=0.01, help="Tolerancia de monto")
@@ -240,6 +260,7 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 if __name__ == "__main__":
+    # Inyección de parámetros y ejecución principal.
     args = parse_args()
     params = MatchParams(
         amount_tolerance=args.amount_tol,

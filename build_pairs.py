@@ -1,7 +1,26 @@
+"""Emparejamiento Sistema ↔ Banco y exportación de 'Sistema + Banco.csv' con Conciliado=1.
+
+Fases:
+- F0 (join exacto por hash): Id banco (opcional), Cuenta, Código, Fecha (día), Monto (2 dec), Referencia idéntica.
+- F1 (join exacto sin Referencia): mismos hashes; calcula similitud de referencia solo para candidatos.
+- Fallback exact (por grupos): filtro por tolerancias y similitud dentro de cada grupo.
+- Relajado: misma cuenta; score compuesto por banco, código, monto, fecha y similitud.
+
+Rendimiento:
+- Joins hash vectorizados resuelven la mayoría de exactos rápidamente.
+- La similitud de referencia se calcula solo en candidatos filtrados (batch).
+- Evita reutilizar contrapartes con asignación codiciosa por mayor score.
+
+Uso:
+- pip install pandas numpy python-dateutil rapidfuzz
+- python build_pairs.py
+"""
+
 from __future__ import annotations
 import sys
 import math
 from dataclasses import dataclass
+import time
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
@@ -21,6 +40,16 @@ SCHEMA_BASE = ["Id banco", "Cuenta bancaria", "Referencia", "Fecha", "Monto", "C
 # Parámetros de matching y pesos del score
 @dataclass
 class MatchParams:
+    """Parámetros de matching y pesos del score.
+    Attributes:
+        amount_tolerance: Tolerancia absoluta para monto (misma moneda).
+        date_window_days: Ventana de días para fecha (abs).
+        ref_similarity_threshold: Umbral de similitud [0,1] para referencia.
+        require_same_bank_exact: Exigir mismo Id banco en exactos F0/F1.
+        require_same_trans_exact: Exigir mismo Código en exactos (bloqueo).
+        w1..w6: Pesos para score del match relajado.
+        log_interval_* / show_progress: Control de logging y progreso.
+    """
     amount_tolerance: float = 0.01  # misma moneda
     date_window_days: int = 1       # días
     ref_similarity_threshold: float = 0.90
@@ -33,10 +62,15 @@ class MatchParams:
     w4_time: float = 1.0
     w5_ref: float = 1.0
     w6_same_trans: float = 1.0
+    # Logging / progreso
+    log_interval_groups: int = 50
+    log_interval_rows: int = 10000
+    show_progress: bool = True
 
 P = MatchParams()
 
 def _to_float(x) -> Optional[float]:
+    """Convierte strings de monto a float; tolera comas, símbolos y vacíos."""
     if pd.isna(x):
         return None
     s = str(x).strip()
@@ -52,6 +86,7 @@ def _to_float(x) -> Optional[float]:
             return None
 
 def _to_date(x) -> Optional[pd.Timestamp]:
+    """Parsea fechas a Timestamp o None si inválida."""
     if pd.isna(x) or str(x).strip() == "":
         return None
     if isinstance(x, (pd.Timestamp, )):
@@ -64,39 +99,109 @@ def _to_date(x) -> Optional[pd.Timestamp]:
     return None
 
 def _norm_text(s: object) -> str:
+    """Normaliza texto a mayúsculas y recorta espacios; vacío si NaN."""
     if pd.isna(s):
         return ""
     return str(s).strip().upper()
 
 def _abs_days(a: pd.Timestamp, b: pd.Timestamp) -> Optional[int]:
+    """Diferencia absoluta en días entre dos timestamps (o None)."""
     if a is None or b is None:
         return None
     return abs((a - b).days)
 
 def _ref_sim(a: str, b: str) -> float:
+    """Similitud de referencias en [0,1] usando token_set_ratio (RapidFuzz)."""
     if not a or not b:
         return 0.0
     return token_set_ratio(a, b) / 100.0
 
 def _prepare(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """Prepara DataFrame para matching: normaliza tipos, crea claves de hash y un índice único."""
     # Mantener solo columnas base
     df = df[SCHEMA_BASE].copy()
     # Tipos y normalización light (ya vienen normalizados de los builds)
-    df["Id banco"] = df["Id banco"].map(_norm_text)
-    df["Cuenta bancaria"] = df["Cuenta bancaria"].map(lambda x: "" if pd.isna(x) else "".join(ch for ch in str(x) if ch.isdigit()))
+    df["Id banco"] = df["Id banco"].map(_norm_text).astype("category")
+    df["Cuenta bancaria"] = df["Cuenta bancaria"].map(lambda x: "" if pd.isna(x) else "".join(ch for ch in str(x) if ch.isdigit())).astype("category")
     df["Referencia"] = df["Referencia"].map(_norm_text)
     df["Fecha_dt"] = df["Fecha"].map(_to_date)
     df["Monto_f"] = df["Monto"].map(_to_float)
-    df["Código"] = df["Código"].map(_norm_text)
+    df["Código"] = df["Código"].map(_norm_text).astype("category")
+    # Claves preformateadas para joins hash (evita float==)
+    df["Fecha_key"] = df["Fecha_dt"].dt.strftime("%Y-%m-%d")
+    df["Monto_key"] = df["Monto_f"].map(lambda v: None if pd.isna(v) else f"{v:.2f}")
     # Índice único para no perder referencia
     df[f"{prefix}_idx"] = np.arange(len(df), dtype=np.int64)
     return df
 
+def _fast_exact_merge(df_s: pd.DataFrame, df_b: pd.DataFrame, params: MatchParams) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Join exacto vectorizado (F0/F1) y retorno de matches + remanente del sistema.
+    Retorna:
+        match: DataFrame [s_idx,b_idx,score] sin reutilización tras greedy.
+        no_used_s: DataFrame del sistema que quedó sin asignar tras F0/F1.
+    """
+    # Filtrar válidos
+    df_s = df_s[~df_s["Monto_f"].isna() & df_s["Fecha_dt"].notna()].copy()
+    df_b = df_b[~df_b["Monto_f"].isna() & df_b["Fecha_dt"].notna()].copy()
+
+    key_base = ["Cuenta bancaria", "Código", "Fecha_key", "Monto_key"]
+    if params.require_same_bank_exact:
+        key = ["Id banco"] + key_base
+    else:
+        key = key_base
+
+    # F0: join incluyendo Referencia
+    key_ref = key + ["Referencia"]
+    cols_keep_s = ["s_idx", "Referencia"]
+    cols_keep_b = ["b_idx", "Referencia"]
+    m0 = df_s[key_ref + ["s_idx"]].merge(
+        df_b[key_ref + ["b_idx"]],
+        how="inner",
+        on=key_ref,
+        suffixes=("_s", "_b")
+    )
+    m0 = m0[["s_idx", "b_idx"]].drop_duplicates()
+    m0["score"] = 200.0  # score alto para exactos
+    used_s = set(m0["s_idx"].tolist())
+    used_b = set(m0["b_idx"].tolist())
+
+    # F1: join por claves exactas sin Referencia (similitud para candidatos)
+    s1 = df_s[~df_s["s_idx"].isin(used_s)][key + cols_keep_s].copy()
+    b1 = df_b[~df_b["b_idx"].isin(used_b)][key + cols_keep_b].copy()
+    if len(s1) == 0 or len(b1) == 0:
+        return m0, df_s[~df_s["s_idx"].isin(used_s)].copy()
+
+    cand = s1.merge(b1, how="inner", on=key, suffixes=("_s", "_b"))
+    # Si no hay candidatos, terminar
+    if cand.empty:
+        return m0, df_s[~df_s["s_idx"].isin(used_s)].copy()
+
+    # Calcular similitud SOLO para filas cand
+    # Batch para no saturar memoria
+    batch = 500_000
+    ok_rows = []
+    for i in range(0, len(cand), batch):
+        chunk = cand.iloc[i:i + batch].copy()
+        sim = [ _ref_sim(a, b) for a, b in zip(chunk["Referencia_s"].tolist(), chunk["Referencia_b"].tolist()) ]
+        sim = np.array(sim, dtype=float)
+        mask = sim >= params.ref_similarity_threshold
+        if mask.any():
+            part = chunk.loc[mask, ["s_idx", "b_idx"]].copy()
+            part["score"] = 150.0 + 10.0 * sim[mask]
+            ok_rows.append(part)
+    m1 = pd.concat(ok_rows, ignore_index=True) if ok_rows else pd.DataFrame(columns=["s_idx","b_idx","score"])
+
+    # Unir F0 + F1
+    match = pd.concat([m0, m1], ignore_index=True) if not m1.empty else m0
+    # Greedy para evitar reutilizar
+    match = _greedy_assign(match, "s_idx", "b_idx", "score")
+
+    used_s2 = set(match["s_idx"].tolist())
+    no_used_s = df_s[~df_s["s_idx"].isin(used_s2)].copy()
+    return match, no_used_s
+
 def _greedy_assign(candidates: pd.DataFrame, left_key: str, right_key: str, score_col: str) -> pd.DataFrame:
-    """
-    candidates: columnas incluyen left_key, right_key, score_col
-    Aplica asignación codiciosa ordenada por score descendente evitando reutilizar contrapartes.
-    """
+    """Asigna pares evitando reutilizar elementos, priorizando mayor score (codicioso)."""
     if candidates.empty:
         return candidates
 
@@ -117,6 +222,8 @@ def _greedy_assign(candidates: pd.DataFrame, left_key: str, right_key: str, scor
     return pd.DataFrame(rows, columns=cand.columns)
 
 def _build_exact_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: MatchParams) -> pd.DataFrame:
+    """Genera candidatos exactos por grupos (fallback) aplicando tolerancias y similitud."""
+    start_time = time.perf_counter()
     # Bloqueo por (Id banco?, Cuenta, Código)
     # Si se requiere mismo banco, el bloque usa (Id banco, Cuenta, Código); si no, (Cuenta, Código)
     if params.require_same_bank_exact:
@@ -131,10 +238,18 @@ def _build_exact_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: Matc
         block_keys = [("Cuenta bancaria", "Código"), common_keys]
 
     records = []
+    groups_total = len(common_keys)
+    groups_done = 0
+    rows_scanned = 0
+    pair_checks = 0
+    candidates_valid = 0
     key_cols, keys = block_keys
+    if params.show_progress:
+        print(f"[INFO] (Exacto) Grupos comunes: {groups_total:,}")
     for key in keys:
         s_g = df_s.loc[s_blocks.groups[key]]
         b_g = df_b.loc[b_blocks.groups[key]]
+        groups_done += 1
 
         # Para cada fila del sistema, filtrar candidatos por monto y fecha
         b_amount = b_g["Monto_f"].to_numpy()
@@ -171,26 +286,39 @@ def _build_exact_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: Matc
             if not mask.any():
                 continue
 
-            # Similitud de referencia
-            sim = np.array([_ref_sim(s_ref, br) for br in b_refs])
-            ok_ref = sim >= params.ref_similarity_threshold
-
-            ok = mask & ok_ref
-            if not ok.any():
+            # Similitud de referencia SOLO para índices con mask=True
+            idx = np.where(mask)[0]
+            if idx.size == 0:
+                continue
+            sim_vals = np.array([_ref_sim(s_ref, b_refs[j]) for j in idx])
+            ok_ref = sim_vals >= params.ref_similarity_threshold
+            if not ok_ref.any():
                 continue
 
-            # Score exacto: base alta + cercanías
-            # Evita divisiones por cero
-            amt_term = 1.0 - np.minimum(amt_diff / max(params.amount_tolerance, 1e-9), 1.0)
-            time_term = 1.0 - np.minimum(days_diff / max(params.date_window_days, 1), 1.0)
-            score = 100.0 + 10.0 * amt_term + 10.0 * time_term + 10.0 * sim
-            for j, m in enumerate(ok):
-                if m:
-                    records.append((
-                        s_idx,
-                        b_idxs[j],
-                        float(score[j])
-                    ))
+            # Stats
+            rows_scanned += 1
+            pair_checks += idx.size
+            candidates_valid += int(ok_ref.sum())
+
+            amt_term_all = 1.0 - np.minimum(amt_diff[idx] / max(params.amount_tolerance, 1e-9), 1.0)
+            time_term_all = 1.0 - np.minimum(days_diff[idx] / max(params.date_window_days, 1), 1.0)
+            score = 100.0 + 10.0 * amt_term_all + 10.0 * time_term_all + 10.0 * sim_vals
+            for j_sub, okv in enumerate(ok_ref):
+                if okv:
+                    j = idx[j_sub]
+                    records.append((s_idx, b_idxs[j], float(score[j_sub])))
+
+            # Log por filas
+            if params.show_progress and rows_scanned % max(1, params.log_interval_rows) == 0:
+                elapsed = time.perf_counter() - start_time
+                rate = rows_scanned / max(elapsed, 1e-9)
+                print(f"[PROGRESS][Exacto] Filas sist eval: {rows_scanned:,} | Checks: {pair_checks:,} | Candidatos válidos: {candidates_valid:,} | Records: {len(records):,} | {rate:,.0f} filas/s")
+
+        # Log por grupos
+        if params.show_progress and groups_done % max(1, params.log_interval_groups) == 0:
+            elapsed = time.perf_counter() - start_time
+            pct = (groups_done / max(groups_total, 1)) * 100.0
+            print(f"[PROGRESS][Exacto] Grupos: {groups_done:,}/{groups_total:,} ({pct:0.1f}%) | Records: {len(records):,} | Tiempo: {elapsed:0.1f}s")
 
     if not records:
         return pd.DataFrame(columns=["s_idx", "b_idx", "score"])
@@ -198,15 +326,26 @@ def _build_exact_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: Matc
     return pd.DataFrame(records, columns=["s_idx", "b_idx", "score"])
 
 def _build_relaxed_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: MatchParams) -> pd.DataFrame:
+    """Genera candidatos relajados por cuenta con score compuesto y tolerancias."""
+    start_time = time.perf_counter()
     # Bloqueo por "Cuenta bancaria" (reduce combinaciones). No exigimos mismo banco ni mismo código.
     s_blocks = df_s.groupby(["Cuenta bancaria"])
     b_blocks = df_b.groupby(["Cuenta bancaria"])
     common_accounts = set(s_blocks.groups.keys()).intersection(b_blocks.groups.keys())
     records = []
+    groups_total = len(common_accounts)
+    groups_done = 0
+    rows_scanned = 0
+    pair_checks = 0
+    candidates_valid = 0
+
+    if params.show_progress:
+        print(f"[INFO] (Relajado) Cuentas comunes: {groups_total:,}")
 
     for acct in common_accounts:
         s_g = df_s.loc[s_blocks.groups[acct]]
         b_g = df_b.loc[b_blocks.groups[acct]]
+        groups_done += 1
 
         b_amount = b_g["Monto_f"].to_numpy()
         b_dates = b_g["Fecha_dt"].to_numpy()
@@ -255,6 +394,10 @@ def _build_relaxed_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: Ma
                 params.w5_ref * ref_term
             )
 
+            # Stats parciales
+            rows_scanned += 1
+            pair_checks += len(b_amount)
+
             for j, m in enumerate(mask):
                 if not m:
                     continue
@@ -263,12 +406,26 @@ def _build_relaxed_candidates(df_s: pd.DataFrame, df_b: pd.DataFrame, params: Ma
                     continue
                 records.append((s_idx, b_idxs[j], sc))
 
+            # Log por filas
+            if params.show_progress and rows_scanned % max(1, params.log_interval_rows) == 0:
+                elapsed = time.perf_counter() - start_time
+                rate = rows_scanned / max(elapsed, 1e-9)
+                print(f"[PROGRESS][Relajado] Filas sist eval: {rows_scanned:,} | Checks: {pair_checks:,} | Records: {len(records):,} | {rate:,.0f} filas/s")
+
+        # Log por grupos
+        if params.show_progress and groups_done % max(1, params.log_interval_groups) == 0:
+            elapsed = time.perf_counter() - start_time
+            pct = (groups_done / max(groups_total, 1)) * 100.0
+            print(f"[PROGRESS][Relajado] Grupos: {groups_done:,}/{groups_total:,} ({pct:0.1f}%) | Records: {len(records):,} | Tiempo: {elapsed:0.1f}s")
+
     if not records:
         return pd.DataFrame(columns=["s_idx", "b_idx", "score"])
 
     return pd.DataFrame(records, columns=["s_idx", "b_idx", "score"])
 
 def build_pairs() -> pd.DataFrame:
+    """Punto de entrada: lee Sistema/Banco, ejecuta F0/F1, fallback y relajado; exporta salida y estadísticas."""
+    start_time_total = time.perf_counter()
     if not SISTEMA_CSV.exists() or not BANCO_CSV.exists():
         print("[ERROR] Faltan archivos Sistema.csv o Banco.csv")
         sys.exit(1)
@@ -276,37 +433,45 @@ def build_pairs() -> pd.DataFrame:
     print(f"[INFO] Leyendo {SISTEMA_CSV.name} y {BANCO_CSV.name}")
     df_s_raw = pd.read_csv(SISTEMA_CSV, dtype=str)
     df_b_raw = pd.read_csv(BANCO_CSV, dtype=str)
+    print(f"[INFO] Tamaños entrada -> Sistema: {len(df_s_raw):,} | Banco: {len(df_b_raw):,}")
 
     df_s = _prepare(df_s_raw, "s")
     df_b = _prepare(df_b_raw, "b")
 
-    # Filtrar filas con monto o fecha inválidos
+    # Filtrar filas con monto o fecha inválidos (mantener por consistencia)
     df_s = df_s[~df_s["Monto_f"].isna() & df_s["Fecha_dt"].notna()].reset_index(drop=True)
     df_b = df_b[~df_b["Monto_f"].isna() & df_b["Fecha_dt"].notna()].reset_index(drop=True)
+    print(f"[INFO] Filtrado válido -> Sistema: {len(df_s):,} | Banco: {len(df_b):,}")
 
-    # Fase 1: candidatos exactos
-    print("[INFO] Generando candidatos exactos...")
-    cand_exact = _build_exact_candidates(df_s, df_b, P)
-    print(f"[INFO] Candidatos exactos: {len(cand_exact)}")
+    # NUEVO: Fase 0/1 por join vectorizado
+    print("[INFO] Join vectorizado para exactos...")
+    match_exact_fast, s_left_after_fast = _fast_exact_merge(df_s, df_b, P)
+    print(f"[INFO] Matches exactos por join: {len(match_exact_fast):,}")
 
-    # Asignación exacta (sin reutilizar)
-    match_exact = _greedy_assign(cand_exact, "s_idx", "b_idx", "score")
-    print(f"[INFO] Matches exactos asignados: {len(match_exact)}")
+    used_s = set(match_exact_fast["s_idx"].tolist())
+    used_b = set(match_exact_fast["b_idx"].tolist())
 
-    # Marcar usados
+    # Fallback exact (optimizado) SOLO sobre no usados (mucho menor)
+    s_rem = df_s[~df_s["s_idx"].isin(used_s)].reset_index(drop=True)
+    b_rem = df_b[~df_b["b_idx"].isin(used_b)].reset_index(drop=True)
+    cand_exact = _build_exact_candidates(s_rem, b_rem, P)
+    match_exact_rest = _greedy_assign(cand_exact, "s_idx", "b_idx", "score")
+    print(f"[INFO] Matches exactos (fallback): {len(match_exact_rest):,}")
+
+    # Unir exactos totales
+    match_exact = pd.concat([match_exact_fast, match_exact_rest], ignore_index=True)
+
+    # Marcar usados tras exactos
     used_s = set(match_exact["s_idx"].tolist())
     used_b = set(match_exact["b_idx"].tolist())
 
-    # Fase 2: candidatos relajados (sobre los no usados)
+    # Fase 2 (relajado) sobre no usados
     s_left = df_s[~df_s["s_idx"].isin(used_s)].reset_index(drop=True)
     b_left = df_b[~df_b["b_idx"].isin(used_b)].reset_index(drop=True)
-
-    print(f"[INFO] Sobrantes para relajado — Sistema: {len(s_left)}, Banco: {len(b_left)}")
+    print(f"[INFO] Sobrantes para relajado — Sistema: {len(s_left):,}, Banco: {len(b_left):,}")
     cand_relaxed = _build_relaxed_candidates(s_left, b_left, P)
-    print(f"[INFO] Candidatos relajados: {len(cand_relaxed)}")
-
     match_relaxed = _greedy_assign(cand_relaxed, "s_idx", "b_idx", "score")
-    print(f"[INFO] Matches relajados asignados: {len(match_relaxed)}")
+    print(f"[INFO] Matches relajados asignados: {len(match_relaxed):,}")
 
     # Unir matches
     matches = pd.concat([match_exact, match_relaxed], ignore_index=True)
@@ -331,7 +496,9 @@ def build_pairs() -> pd.DataFrame:
 
     # Exportar
     out.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    elapsed_total = time.perf_counter() - start_time_total
     print(f"[OK] Exportado: {OUTPUT_CSV} ({len(out)} filas)")
+    print(f"[STATS] Tiempo total: {elapsed_total:0.2f}s | Matches exactos: {len(match_exact)} | Matches relajados: {len(match_relaxed)} | Matches totales: {len(matches)}")
 
     # Previsualización
     print("\n[PREVIEW] Primeras 10 filas Sistema + Banco (Conciliado=1):")

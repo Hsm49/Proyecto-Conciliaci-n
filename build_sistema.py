@@ -1,3 +1,23 @@
+"""Construcción de la hoja/archivo 'Sistema' a partir de múltiples tablas de PeopleSoft.
+
+Este script:
+- Detecta todas las variantes de las tablas del sistema (PS_BNK_RCN_TRAN, PS_CASH_FLOW_TR, PS_PAYMENT_TBL) en 'Set Datos Conciliacion'.
+- Normaliza columnas al esquema base: Id banco, Cuenta bancaria, Referencia, Fecha, Monto, Código.
+- Aplica limpieza de texto, fechas y montos; preserva ceros de cuentas.
+- Deduplica y exporta 'Sistema.csv'.
+
+Entradas:
+- Carpeta: ./Set Datos Conciliacion
+  - Archivos CSV/XLSX/Parquet/TSV cuyos nombres u hojas contengan los nombres base de tabla.
+
+Salida:
+- ./Sistema.csv (UTF-8 BOM)
+
+Uso:
+- pip install pandas python-dateutil openpyxl pyarrow
+- python build_sistema.py
+"""
+
 from __future__ import annotations
 import re
 import sys
@@ -46,16 +66,24 @@ COLUMN_MAP: Dict[str, Dict[str, str]] = {
 
 @dataclass
 class ReadResult:
+    """Resultado de lectura de una fuente detectada.
+    Attributes:
+        table: Nombre base de la tabla (e.g., 'PS_BNK_RCN_TRAN').
+        df: DataFrame cargado de la fuente.
+        source: Ruta de archivo y, si aplica, nombre de hoja 'archivo.xlsx#Hoja'.
+    """
     table: str
     df: pd.DataFrame
     source: str  # filepath or file+sheet
 
 
 def _strip_accents(s: str) -> str:
+    """Elimina acentos del string usando normalización Unicode."""
     return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
 
 
 def _norm_text(x: object) -> str:
+    """Normaliza texto: trim, mayúsculas, sin acentos y colapsa espacios."""
     if pd.isna(x):
         return ""
     s = str(x).strip()
@@ -65,6 +93,7 @@ def _norm_text(x: object) -> str:
 
 
 def _norm_account(x: object) -> str:
+    """Normaliza la cuenta bancaria dejando solo dígitos y conservando ceros a la izquierda."""
     if pd.isna(x):
         return ""
     s = re.sub(r"\D+", "", str(x))
@@ -72,12 +101,12 @@ def _norm_account(x: object) -> str:
 
 
 def _parse_date(x: object) -> Optional[pd.Timestamp]:
+    """Parsea fechas tolerando formatos comunes (dd/mm y mm/dd) y valores de Excel."""
     if pd.isna(x) or (isinstance(x, str) and x.strip() == ""):
         return None
     if isinstance(x, (pd.Timestamp, )):
         return pd.to_datetime(x)
     s = str(x).strip()
-    # Intento robusto: día/mes por defecto para datos en español
     for dayfirst in (True, False):
         try:
             dt = dtparser.parse(s, dayfirst=dayfirst)
@@ -88,36 +117,25 @@ def _parse_date(x: object) -> Optional[pd.Timestamp]:
 
 
 def _norm_date_to_iso(x: object) -> str:
+    """Devuelve la fecha en formato ISO 'YYYY-MM-DD' o vacío si no es válida."""
     dt = _parse_date(x)
     return "" if dt is None else dt.strftime("%Y-%m-%d")
 
 
 def _parse_amount(x: object) -> Optional[float]:
+    """Convierte montos a float manejando separadores de miles/decimales y símbolos."""
     if pd.isna(x) or (isinstance(x, str) and x.strip() == ""):
         return None
     s = str(x).strip()
-    # Eliminar espacios y signos de moneda
     s = re.sub(r"[^\d,.\-]", "", s)
-    # Heurística: decidir separador decimal
     if "," in s and "." in s:
-        # Tomar el último separador como decimal
         if s.rfind(",") > s.rfind("."):
-            # coma decimal, puntos miles
-            s = s.replace(".", "")
-            s = s.replace(",", ".")
+            s = s.replace(".", "").replace(",", ".")
         else:
-            # punto decimal, comas miles
             s = s.replace(",", "")
     elif "," in s:
-        # Si hay una sola coma, revisar si hay 3 dígitos a la derecha (miles) o <=2 (decimal)
         parts = s.split(",")
-        if len(parts[-1]) in (1, 2):  # probablemente decimal
-            s = s.replace(",", ".")
-        else:  # probablemente miles
-            s = s.replace(",", "")
-    else:
-        # solo dígitos y/o punto: interpretar punto como decimal
-        pass
+        s = s.replace(",", ".") if len(parts[-1]) in (1, 2) else s.replace(",", "")
     try:
         return float(s)
     except Exception:
@@ -125,17 +143,17 @@ def _parse_amount(x: object) -> Optional[float]:
 
 
 def _read_csv(fp: Path) -> pd.DataFrame:
-    # Intentar codificaciones comunes
+    """Lee CSV probando codificaciones comunes para evitar errores por BOM/acentos."""
     for enc in ("utf-8-sig", "latin-1"):
         try:
             return pd.read_csv(fp, encoding=enc, dtype=str)
         except Exception:
             continue
-    # fallback
     return pd.read_csv(fp, dtype=str)
 
 
 def _read_any(filepath: Path, sheet: Optional[str] = None) -> pd.DataFrame:
+    """Lee archivos CSV/XLSX/Parquet/TSV y retorna DataFrame de strings."""
     ext = filepath.suffix.lower()
     if ext in (".csv",):
         return _read_csv(filepath)
@@ -149,10 +167,8 @@ def _read_any(filepath: Path, sheet: Optional[str] = None) -> pd.DataFrame:
 
 
 def _find_sources(input_dir: Path, table_names: List[str]) -> List[Tuple[str, Path, Optional[str]]]:
-    """
-    Devuelve lista de tuplas (table_name, filepath, sheet_name|None)
-    - Busca TODOS los archivos que contengan el nombre base de la tabla (e.g. PS_BNK_RCN_TRAN_*)
-    - También busca hojas en archivos Excel que contengan el nombre base en el nombre de la hoja.
+    """Encuentra TODAS las fuentes que contengan el nombre base de cada tabla (archivos u hojas).
+    Retorna tuplas (nombre_tabla, ruta_archivo, hoja|None).
     """
     results: List[Tuple[str, Path, Optional[str]]] = []
     if not input_dir.exists():
@@ -190,6 +206,7 @@ def _find_sources(input_dir: Path, table_names: List[str]) -> List[Tuple[str, Pa
 
 
 def _rename_and_project(df: pd.DataFrame, table: str) -> pd.DataFrame:
+    """Renombra columnas según COLUMN_MAP, asegura el esquema base y normaliza valores."""
     mapping = COLUMN_MAP[table]
     # Renombrar intersección
     cols_inter = {src: dst for src, dst in mapping.items() if src in df.columns}
@@ -220,6 +237,7 @@ def _rename_and_project(df: pd.DataFrame, table: str) -> pd.DataFrame:
 
 
 def build_sistema() -> pd.DataFrame:
+    """Construye el DataFrame unificado del Sistema aplicando mapeo, normalización y deduplicación."""
     sources = _find_sources(INPUT_DIR, SYSTEM_TABLES)
     if not sources:
         print(f"[ADVERTENCIA] No se encontraron archivos para {SYSTEM_TABLES} en: {INPUT_DIR}")
@@ -251,6 +269,7 @@ def build_sistema() -> pd.DataFrame:
 
 
 def main():
+    """Punto de entrada: construye y exporta Sistema.csv, mostrando una previsualización."""
     print(f"[INFO] Carpeta de entrada: {INPUT_DIR}")
     df_sis = build_sistema()
     if df_sis.empty:
